@@ -8,13 +8,17 @@ import PIL
 
 # PyTorch imports
 import torch
+from torch.serialization import validate_cuda_device
+import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets
 from torchvision import transforms
 from torchvision.transforms import ToTensor
 
+from torch.utils.tensorboard.writer import SummaryWriter
 
 # --------------------------------
 # ===       PyTorch Code       ===
@@ -66,12 +70,24 @@ print("PyTorch Script running...")
 #           and then optimize the parameters, so that the next guess will be more accurate.
 #       - This process can be automated in PyTorch.
 
+# Global variables
+BATCH_SIZE: int = 4
+
+# NOTE: This got me basically 100% very easily. I suppose it is most likely overfitting, but still was nice to see.
+# EPOCHS: int = 72
+# LEARNING_RATE: float = 0.01
+
+EPOCHS: int = 20
+LEARNING_RATE: float = 0.01
+
 # Specify directory which holds dataset.
 data_directory = r'./dataset-raw/'
 shapes_directory = r'./dataset-raw/shapes/'
 labels_path = r'./dataset-raw/annotations/labels.csv'
 image_folder = r'./dataset-raw/image-folder/'
+save_path = r'./model/neural_model.pth'
 
+writer = SummaryWriter("runs/Reclipse/testing_tensorboard")
 
 # Perform required transforms.
 # - Set images to 32x32
@@ -79,9 +95,10 @@ image_folder = r'./dataset-raw/image-folder/'
 # NOTE: Not sure if this should be tensored first or last...
 data_transform = transforms.Compose(
     [
-        transforms.Resize(32),
+        transforms.Resize((32, 32)),
         transforms.Grayscale(1),
-        ToTensor()
+        ToTensor(),
+        transforms.Normalize((0.5), (0.5))      # I do not know if this is required for my dataset.
     ]
 )
 
@@ -93,15 +110,17 @@ transformed_dataset = datasets.ImageFolder(
 )
 
 # Use PyTorch DataLoader to load in the transformed data. (Also specify batch-size and shuffling.)
-data = DataLoader(
+trainloader = DataLoader(
     transformed_dataset,
-    batch_size = 4,
+    batch_size = BATCH_SIZE,
     shuffle = True
 )
 
-# Store all images into 'images' variable, and all labels into 'labels' variable.
-# By iterating over the properly loaded dataset.
-# NOTE: The variables are of type 2D-Array. (?)
+testloader = DataLoader(
+    transformed_dataset,
+    batch_size = BATCH_SIZE,
+    shuffle = True
+)
 
 
 # Defining Neural Network (Model)
@@ -134,50 +153,186 @@ class MyNeuralNetwork(nn.Module):
 model = MyNeuralNetwork()
 
 # Printing info about network layers.
-print("Neural Network Layers:")
+print("Neural Network Layers: ")
 print(model)
 
 # Printing info about network paremeters.
 network_parameters = list(model.parameters())
-print(len(network_parameters))
-print(network_parameters[0].size())
+print(f"Len of params: {len(network_parameters)}")
+print(f"Weights of layer 1: {network_parameters[0].size()}")
+
+# Test print data and labels as tensors.
+def print_data_as_tensors():
+    for index, data in enumerate(trainloader, 0):
+        print(index)
+        input, labels = data
+        print(f"Inputs: {input}")               # Inputs contains BATCH_SIZE images.
+        print(f"Labels: {labels}")              # Labels also contains BATCH_SIZE labels. Hmm.
+        print(f"InputShape: {input.size()}")
+        print(f"LabelShape: {labels.size()}")
+
+# Call the print. (Noisy output, disabled if not needed.)
+# print_data_as_tensors()
+
+classes = ('ellipse', 'rectangle', 'indexerror', 'indexerror')
+
+# helper function to show an image
+# (used in the `plot_classes_preds` function below)
+def matplotlib_imshow(img, one_channel=False):
+    if one_channel:
+        img = img.mean(dim=0)
+    img = img / 2 + 0.5     # unnormalize
+    npimg = img.numpy()
+    if one_channel:
+        plt.imshow(npimg, cmap="Greys")
+    else:
+        plt.imshow(np.transpose(npimg, (1, 2, 0)))
 
 
-# Model Training
+def images_to_probs(net, images):
+    '''
+    Generates predictions and corresponding probabilities from a trained
+    network and a list of images
+    '''
+    output = net(images)
+    # convert output probabilities to predicted class
+    _, preds_tensor = torch.max(output, 1)
+    preds = np.squeeze(preds_tensor.numpy())
+    return preds, [F.softmax(el, dim=0)[i].item() for i, el in zip(preds, output)]
 
-# prediction = model(data)      # Forward Pass
 
-# loss = (prediction - labels).sum()
+def plot_classes_preds(net, images, labels):
+    '''
+    Generates matplotlib Figure using a trained network, along with images
+    and labels from a batch, that shows the network's top prediction along
+    with its probability, alongside the actual label, coloring this
+    information based on whether the prediction was correct or not.
+    Uses the "images_to_probs" function.
+    '''
+    preds, probs = images_to_probs(net, images)
+    # plot the images in the batch, along with predicted and true labels
+    fig = plt.figure(figsize=(12, 6))
+    for idx in np.arange(2):
+        ax = fig.add_subplot(1, 4, idx + 1, xticks=[], yticks=[])
+        matplotlib_imshow(images[idx], one_channel=True)
+        ax.set_title("{0}, {1:.1f}%\n(label: {2})".format(
+            classes[preds[idx]],
+            probs[idx] * 100.0,
+            classes[labels[idx]]),
+                    color=("green" if preds[idx]==labels[idx].item() else "red"))
+    return fig
 
-# loss.backward()               # backward pass
+# Model Training Section -> Start
 
-# Pre-existing optimizer in PyTorch.
-# optim = torch.optim.SGD(model.parameters(), lr=1e-2, momentum=0.9)
+# Define loss function. 
+criterion = nn.CrossEntropyLoss()                                    # Use CrossEntropyLoss as loss function.
 
-# optim.step()                  # Gradient Descent
+# Define optimizer to use. (Pre-existing optimizer in PyTorch.)
+optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=0.9)     # Stochastic gradient descent
 
+# Training loop.
+def train(number_of_epochs: int):
+    log_step = 0
+    for epoch in range(number_of_epochs):
+        running_loss = 0.0
+
+        # Loop over data.
+        for i, data in enumerate(trainloader, 0):
+            # Get the inputs; data is a list of [inputs, labels]
+            input_image_batch, target_labels = data
+
+            # Zero the gradients.
+            optimizer.zero_grad()
+
+            # Put the inputs through the model. (Neural Network)
+            output = model(input_image_batch)           # Forward Pass
+
+            # Calculate loss using loss function. Output and target as input. The labels are the targets.
+            loss = criterion(output, target_labels)
+            print(f"Loss: {loss}")
+            loss.backward()                             # Backward Pass
+            optimizer.step()                            # Gradient Descent
+
+            # features = input_image_batch.reshape(input_image_batch.shape[0], -1)
+            _, predictions = output.max(1)
+            # class_labels = [classes_array[label] for label in predictions]
+            num_correct = (predictions == target_labels).sum()
+            running_training_accuracy = float(num_correct) / float(input_image_batch.shape[0])
+
+            # Print statistics. (Optional)
+            running_loss += loss.item()
+            if i % 10 == 9:    # print every 50 mini-batches
+                print(f'[{epoch + 1}, {i + 1:5d}] loss: {running_loss / 10:.3f}')
+
+                # Log loss and accuracy to Tensorboard.
+                writer.add_scalar("Training Loss",
+                                running_loss / 10,
+                                global_step=epoch * len(trainloader) + i)
+
+                writer.add_scalar("Training Accuracy",
+                                running_training_accuracy, 
+                                global_step=epoch * len(trainloader) + i)
+
+                # writer.add_embedding(features, metadata=class_labels,
+                                    # label_img=input_image_batch, global_step=i)
+
+                # Log images used in batches to Tensorboard.
+                image_grid = torchvision.utils.make_grid(input_image_batch)
+                writer.add_image("Images",
+                                image_grid,
+                                global_step=epoch * len(trainloader) + i)
+
+                # ...log a Matplotlib Figure showing the model's predictions on a
+                # random mini-batch
+                writer.add_figure('predictions vs. actuals',
+                                plot_classes_preds(model, input_image_batch, target_labels),
+                                global_step=epoch * len(trainloader) + i)
+
+                running_loss = 0.0
+
+
+# Activate Training
+train(EPOCHS)
+print("Finished Training.")
+torch.save(model.state_dict(), save_path)
+
+model_to_validate = MyNeuralNetwork()
+model_to_validate.load_state_dict(torch.load(save_path))
+
+# Do some sort of validation testing.
+def validate():
+
+    validation_step = 0
+    for i, data in enumerate(testloader, 0):
+
+        image_batch, labels = data
+
+        writer.add_figure('validation',
+                        plot_classes_preds(model_to_validate, image_batch, labels),
+                        global_step=validation_step)
+
+        validation_step += 1
+
+
+validate()
+
+
+
+# Mostly irrelevant notes:
 
 # Show amount of images in dataset.
 # print("Image-count: ", len(images))
 
-
 # Example of loading a single image into a variable:
 # image = images[2][0]
-
 
 # Example of visualizing a loaded-in image.
 # plt.imshow(image, cmap="gray")
 
-
 # Example of printing the size (dimensions) of the image.
 # print("Image size: ", image.size())
 
-
-
-
-
-
-
-
+# Print labels
+# print(' '.join(f'{classes[labels[i]]:5s}' for i in range(BATCH_SIZE)))
 
 
